@@ -43,7 +43,7 @@ def normalize_pref(raw):
 with open(INPUT_FILE, newline="") as infile, open(OUTPUT_FILE, "w", newline="") as outfile:
     reader = csv.DictReader(infile)
     fieldnames = [
-        "ra_id","name","home_area_pref","block_pref",
+        "ra_id","name","home_area","home_area_pref","block_pref",
         "Sun","Mon","Tue","Wed","Thu",
         "blackout_dates","weekend_unavailable"
     ]
@@ -59,6 +59,7 @@ with open(INPUT_FILE, newline="") as infile, open(OUTPUT_FILE, "w", newline="") 
         outrow = {
             "ra_id": ra_id,
             "name": name,
+            "home_area": row.get("Home Area", "").strip(),
             "home_area_pref": row["Preference for NE1 vs NE2?"].strip(),
             "block_pref": "Yes" if "Yes" in row["Preference for block scheduling?"] else "No",
             "Sun": normalize_pref(row["Sunday's"]),

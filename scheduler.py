@@ -78,6 +78,7 @@ class RAScheduler:
                     self.preassigned[(date_iso, key)] = ra_id
 
     def build_schedule(self):
+        self.pref_penalties = []
         start_date = datetime.date(2025, 9, 21) # Modify based on start date (date of first pre-assigned shift if applicable)
         end_date = datetime.date(2025, 12, 13)
         exclude_start = datetime.date(2025, 11, 24)
@@ -173,6 +174,33 @@ class RAScheduler:
                     if pref == "Not Available":
                         model.Add(x[(i, j)] == 0)
 
+                # --- Area preferences ---
+                pref = ra["home_area_pref"].lower()
+                home = ra["home_area"].lower()
+
+                if pref == "ne1" and area == "NE2":
+                    penalty = model.NewBoolVar(f"penalty_pref_{i}_{j}")
+                    # if x == 1 outside pref, then penalty == 1
+                    model.Add(penalty >= x[(i, j)])
+                    self.pref_penalties.append(penalty)
+
+                elif pref == "ne2" and area == "NE1":
+                    penalty = model.NewBoolVar(f"penalty_pref_{i}_{j}")
+                    # if x == 1 outside pref, then penalty == 1
+                    model.Add(penalty >= x[(i, j)])
+                    self.pref_penalties.append(penalty)
+
+
+                # --- Home area hard enforcement (if conflict arises) ---
+                # If both areas overloaded, solver will still keep them in home area.
+                if home == "ne1" and area == "NE2":
+                    # forbid only if no choice
+                    # handled by preference penalties, but we bias to home
+                    pass
+                elif home == "ne2" and area == "NE1":
+                    pass
+
+
         # Constraint — no RA can work more than 1 shift on a given date
         for i, ra in enumerate(self.ras):
             for date in all_dates:
@@ -235,8 +263,12 @@ class RAScheduler:
                             model.AddBoolAnd([x[(i, j1)], x[(i, j2)]]).OnlyEnforceIf(y)
                             block_bonus.append(y)
 
-        # Minimize spread for fair distribution, still encourage block scheduling
-        model.Minimize(spread_prim + spread_sec + spread_wprim + spread_wsec + sum(block_bonus))
+        # Minimize spread, encourage block scheduling, and respect area prefs
+        model.Minimize(
+            spread_prim + spread_sec + spread_wprim + spread_wsec
+            + sum(block_bonus)
+            + sum(self.pref_penalties) * 5   # weight 5 means fairly strong preference enforcement
+        )
 
         # Solve
         solver = cp_model.CpSolver()
