@@ -6,11 +6,13 @@ from ortools.sat.python import cp_model
 
 
 class RAScheduler:
-    def __init__(self, prefs_file, outdir):
+    def __init__(self, prefs_file, outdir, preassigned_file=None):
         self.prefs_file = prefs_file
         self.outdir = outdir
+        self.preassigned_file = preassigned_file
         self.ras = []
         self.schedule = []
+        self.preassigned = {}  # will hold {(date_iso, key): ra_id}
         self.assignments = defaultdict(lambda: {
             "primaries": 0,
             "secondaries": 0,
@@ -31,8 +33,52 @@ class RAScheduler:
                 ] if row["weekend_unavailable"] else []
                 self.ras.append(row)
 
+    def load_preassigned(self):
+        """
+        Reads optional CSV of already-scheduled shifts.
+        Expected columns: date,NE1_primary,NE2_primary,NE1_secondary,NE2_secondary
+        Names in CSV are matched to existing RAs by first name (case-insensitive).
+        If CSV contains a name that doesn't match any RA, a warning is printed and that cell is ignored.
+        """
+        if not self.preassigned_file:
+            return
+
+        # build mapping from first name -> ra_id (if ambiguous, prefer exact full name)
+        first_to_ids = {}
+        full_to_id = {}
+        for ra in self.ras:
+            first = ra["name"].split()[0].lower()
+            first_to_ids.setdefault(first, []).append(ra["ra_id"])
+            full_to_id[ra["name"].lower()] = ra["ra_id"]
+
+        with open(self.preassigned_file, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                date_iso = row["date"].strip()
+                for key in ["NE1_primary", "NE2_primary", "NE1_secondary", "NE2_secondary"]:
+                    val = row.get(key, "").strip()
+                    if not val:
+                        continue
+                    # try exact full-name match first
+                    val_l = val.lower()
+                    if val_l in full_to_id:
+                        ra_id = full_to_id[val_l]
+                    else:
+                        # try first name match (case-insensitive)
+                        possible = first_to_ids.get(val.split()[0].lower(), [])
+                        if len(possible) == 1:
+                            ra_id = possible[0]
+                        elif len(possible) > 1:
+                            print(f"⚠️ Ambiguous first name '{val}' on {date_iso} for {key} — ignoring (multiple RAs match).")
+                            continue
+                        else:
+                            print(f"⚠️ Unknown RA name '{val}' on {date_iso} for {key} — ignoring (no match).")
+                            continue
+
+                    self.preassigned[(date_iso, key)] = ra_id
+
     def build_schedule(self):
-        start_date = datetime.date(2025, 9, 21)
+        start_date = datetime.date(2025, 9, 21) # Modify based on start date (date of first pre-assigned shift if applicable)
         end_date = datetime.date(2025, 12, 13)
         exclude_start = datetime.date(2025, 11, 24)
         exclude_end = datetime.date(2025, 11, 30)
@@ -51,6 +97,11 @@ class RAScheduler:
                 shifts.append((date, area, "primary"))
                 shifts.append((date, area, "secondary"))
 
+        # --- Load preassigned CSV (if provided) ---
+        # (self.preassigned was filled by load_preassigned)
+        # We'll enforce those preassignments in the CP model below.
+        # Keys in preassigned are (date_iso, "NE1_primary"), etc.
+
         model = cp_model.CpModel()
         x = {}
 
@@ -58,6 +109,47 @@ class RAScheduler:
         for i, ra in enumerate(self.ras):
             for j, (date, area, role) in enumerate(shifts):
                 x[(i, j)] = model.NewBoolVar(f"x_{i}_{j}")
+
+        # ------------------------
+        # Enforce preassigned shifts (if any)
+        # ------------------------
+        # We'll also increment self.assignments counters so the balancing
+        # objective accounts for these preexisting assignments.
+        # Build a mapping from ra_id -> index (i)
+        raid_to_index = {ra["ra_id"]: idx for idx, ra in enumerate(self.ras)}
+
+        # For any preassigned (date, key) entry, we will:
+        #   - force x[(i_target, j)] == 1 for the target RA,
+        #   - force x[(i_other, j)] == 0 for all other RAs.
+        for j, (date, area, role) in enumerate(shifts):
+            key = f"{area}_{role}"  # matches CSV column names
+            date_iso = date.isoformat()
+            pa_key = (date_iso, key)
+            if pa_key in self.preassigned:
+                ra_id = self.preassigned[pa_key]
+                if ra_id not in raid_to_index:
+                    print(f"⚠️ preassigned ra_id '{ra_id}' for {pa_key} not found among loaded RAs — ignoring preassignment.")
+                    continue
+                i_target = raid_to_index[ra_id]
+                # force target == 1
+                model.Add(x[(i_target, j)] == 1)
+                # force all others == 0
+                for i in range(len(self.ras)):
+                    if i == i_target:
+                        continue
+                    model.Add(x[(i, j)] == 0)
+
+                # pre-increment counters so balancing objective sees these
+                # (we do it here because we know which index -> ra_id)
+                ra_assign = self.assignments[ra_id]
+                if role == "primary":
+                    ra_assign["primaries"] += 1
+                    if date.weekday() in [4, 5]:
+                        ra_assign["weekend_primaries"] += 1
+                else:
+                    ra_assign["secondaries"] += 1
+                    if date.weekday() in [4, 5]:
+                        ra_assign["weekend_secondaries"] += 1
 
         # Constraints: each shift has exactly 1 RA
         for j, (date, area, role) in enumerate(shifts):
@@ -170,6 +262,12 @@ class RAScheduler:
                     first_name = ra["name"].split()[0]
                     schedule_by_date[date.isoformat()][key] = first_name
 
+                    # only increment if not already preassigned (avoid double count)
+                    date_iso = date.isoformat()
+                    if (date_iso, key) in self.preassigned:
+                        # already counted earlier when enforcing preassignments
+                        continue
+
                     if role == "primary":
                         self.assignments[ra["ra_id"]]["primaries"] += 1
                         if date.weekday() in [4, 5]:
@@ -227,10 +325,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prefs", required=True, help="Path to RA preferences CSV")
     parser.add_argument("--outdir", required=True, help="Directory for outputs")
+    parser.add_argument("--preassigned", required=False, help="(optional) CSV of pre-assigned shifts")
     args = parser.parse_args()
 
-    scheduler = RAScheduler(args.prefs, args.outdir)
+    scheduler = RAScheduler(args.prefs, args.outdir, preassigned_file=args.preassigned)
     scheduler.load_preferences()
+    # load preassigned AFTER loading preferences (so name -> ra mapping exists)
+    scheduler.load_preassigned()
     scheduler.build_schedule()
     scheduler.save_outputs()
 
